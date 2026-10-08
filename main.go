@@ -35,6 +35,7 @@ static EventHotKeyRef printScreenHotKeyRef = NULL;
 static EventHandlerRef printScreenEventHandlerRef = NULL;
 static int timerMinutes[3] = {10, 20, 30};
 static NSInteger timerRemainingSeconds = 0;
+static NSInteger timerLastDurationSeconds = 0;
 static BOOL timerRunning = NO;
 static BOOL timerPaused = NO;
 static BOOL timerSessionActive = NO;
@@ -184,6 +185,7 @@ static OSStatus handlePrintScreenHotKey(EventHandlerCallRef nextHandler,
 @property(nonatomic, retain) NSTextField *timerConfig20Field;
 @property(nonatomic, retain) NSTextField *timerConfig30Field;
 - (void)refreshCodexQuotaBarTitle;
+- (void)startTimerForDuration:(NSInteger)duration recordAsLast:(BOOL)recordAsLast;
 @end
 
 @implementation HelloController
@@ -231,7 +233,14 @@ static OSStatus handlePrintScreenHotKey(EventHandlerCallRef nextHandler,
 - (void)startTimerPreset:(id)sender {
     NSInteger index = [sender tag];
     if (index < 0 || index >= 3) return;
-    timerRemainingSeconds = timerMinutes[index] * 60;
+    [self startTimerForDuration:timerMinutes[index] * 60 recordAsLast:YES];
+}
+
+// 用指定时长启动倒计时；“重复上一次”沿用原时长，不覆盖记录。
+- (void)startTimerForDuration:(NSInteger)duration recordAsLast:(BOOL)recordAsLast {
+    if (duration <= 0) return;
+    timerRemainingSeconds = duration;
+    if (recordAsLast) timerLastDurationSeconds = duration;
     timerRunning = YES; timerPaused = NO; timerSessionActive = YES; timerHidden = NO; timerHiddenUntil = nil;
     if (timerTick != nil) { [timerTick invalidate]; timerTick = nil; }
     // 普通 Timer 在菜单追踪事件模式下会暂停；加入 CommonModes 后菜单展开时仍每秒刷新剩余时间。
@@ -280,12 +289,22 @@ static OSStatus handlePrintScreenHotKey(EventHandlerCallRef nextHandler,
             NSTextField *done = [NSTextField labelWithString:@"时间到"]; [done setFrame:NSMakeRect(25, 135, 275, 60)];
             [done setFont:[NSFont boldSystemFontOfSize:40]]; [done setAlignment:NSTextAlignmentCenter]; [[timerDoneWindow contentView] addSubview:done];
             NSButton *close = [NSButton buttonWithTitle:@"关闭" target:self action:@selector(closeTimerDone:)];
-            [close setFrame:NSMakeRect(105, 70, 115, 36)]; [close setBezelStyle:NSBezelStyleRounded]; [[timerDoneWindow contentView] addSubview:close];
+            [close setFrame:NSMakeRect(36, 70, 112, 36)]; [close setBezelStyle:NSBezelStyleRounded]; [[timerDoneWindow contentView] addSubview:close];
+            NSButton *repeat = [NSButton buttonWithTitle:@"重复上一次" target:self action:@selector(repeatLastTimer:)];
+            [repeat setFrame:NSMakeRect(170, 70, 120, 36)]; [repeat setBezelStyle:NSBezelStyleRounded]; [[timerDoneWindow contentView] addSubview:repeat];
         }
         [timerDoneWindow center];
         [timerDoneWindow makeKeyAndOrderFront:nil]; [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
         [self refreshTimerMenu];
     }
+}
+
+// 收起结束提示，并按最近一次选中的完整时长重新开始。
+- (void)repeatLastTimer:(id)sender {
+    (void)sender;
+    if (timerLastDurationSeconds <= 0) return;
+    [timerDoneWindow orderOut:nil];
+    [self startTimerForDuration:timerLastDurationSeconds recordAsLast:NO];
 }
 
 // 仅由“关闭”按钮收起时间到提示。
