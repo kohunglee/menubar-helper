@@ -1,0 +1,9 @@
+# macOS packaging and locally built executables
+*.app/
+/GoHello
+/GoHelloTwinTail
+/GoWhiteTwinTail
+
+# Finder and Xcode artifacts
+.DS_Store
+*.dSYM/
