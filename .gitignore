@@ -4,6 +4,9 @@
 /GoHelloTwinTail
 /GoWhiteTwinTail
 
+# Local per-day usage records are private runtime data.
+/time-log/
+
 # Finder and Xcode artifacts
 .DS_Store
 *.dSYM/

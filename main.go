@@ -35,16 +35,117 @@ static EventHotKeyRef printScreenHotKeyRef = NULL;
 static EventHandlerRef printScreenEventHandlerRef = NULL;
 static int timerMinutes[3] = {10, 20, 30};
 static NSInteger timerRemainingSeconds = 0;
-static NSInteger timerLastDurationSeconds = 0;
+static NSInteger timerConfiguredDurationSeconds = 0;
 static BOOL timerRunning = NO;
 static BOOL timerPaused = NO;
 static BOOL timerSessionActive = NO;
+static BOOL timerLogEnabled = YES;
+static BOOL timerEnforcementEnabled = YES;
+static BOOL timerDoneBackgroundEnabled = YES;
+static NSInteger timerIdleMinutes = 30;
 static BOOL timerHidden = NO;
 static NSDate *timerHiddenUntil = nil;
+static NSDate *timerStartedAt = nil;
+static NSDate *timerIdleSince = nil;
+static NSDate *timerReminderDueAt = nil;
 static NSTimer *timerTick = nil;
+static NSTimer *timerIdleMonitor = nil;
 static NSPanel *timerBallPanel = nil;
 static NSView *timerBallView = nil;
 static NSWindow *timerDoneWindow = nil;
+static NSWindow *timerReminderWindow = nil;
+static NSImageView *timerDoneBackgroundView = nil;
+static NSString *timerPendingLogPath = nil;
+static NSString *timerPendingLogRecord = nil;
+static NSString *timerPendingLogUnratedRecord = nil;
+
+// 将本次完整计时追加到日志，并保留该行供评分按钮更新。
+static BOOL appendTimerCompletionLog(NSDate *startedAt, NSDate *endedAt, NSInteger durationSeconds) {
+    if (!timerLogEnabled || startedAt == nil || endedAt == nil || durationSeconds <= 0) return NO;
+
+    NSString *directory = [[[NSHomeDirectory() stringByAppendingPathComponent:@"studio"]
+        stringByAppendingPathComponent:@"go-hello-mac"] stringByAppendingPathComponent:@"time-log"];
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSError *directoryError = nil;
+    if (![fileManager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:&directoryError]) {
+        NSLog(@"无法创建微微倒计时日志目录：%@", directoryError);
+        return NO;
+    }
+
+    NSDateFormatter *dayFormatter = [[[NSDateFormatter alloc] init] autorelease];
+    [dayFormatter setLocale:[[[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"] autorelease]];
+    [dayFormatter setTimeZone:[NSTimeZone localTimeZone]];
+    [dayFormatter setDateFormat:@"yyyy-MM-dd"];
+    NSString *filePath = [directory stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"%@.log", [dayFormatter stringFromDate:endedAt]]];
+
+    NSDateFormatter *timeFormatter = [[[NSDateFormatter alloc] init] autorelease];
+    [timeFormatter setLocale:[[[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"] autorelease]];
+    [timeFormatter setTimeZone:[NSTimeZone localTimeZone]];
+    [timeFormatter setDateFormat:@"yyyy-MM-dd HH:mm:ss"];
+    NSString *record = [NSString stringWithFormat:@"开始时间：%@ | 结束时间：%@ | 计时时长：%ld 分钟 | 本次打分：未评分\n",
+        [timeFormatter stringFromDate:startedAt],
+        [timeFormatter stringFromDate:endedAt],
+        (long)(durationSeconds / 60)];
+
+    if (![fileManager fileExistsAtPath:filePath] &&
+        ![fileManager createFileAtPath:filePath contents:[NSData data] attributes:nil]) {
+        NSLog(@"无法创建微微倒计时日志文件：%@", filePath);
+        return NO;
+    }
+    NSFileHandle *logFile = [NSFileHandle fileHandleForWritingAtPath:filePath];
+    if (logFile == nil) {
+        NSLog(@"无法写入微微倒计时日志文件：%@", filePath);
+        return NO;
+    }
+    @try {
+        [logFile seekToEndOfFile];
+        [logFile writeData:[record dataUsingEncoding:NSUTF8StringEncoding]];
+        [logFile closeFile];
+        [timerPendingLogPath release];
+        timerPendingLogPath = [filePath copy];
+        [timerPendingLogRecord release];
+        timerPendingLogRecord = [record copy];
+        [timerPendingLogUnratedRecord release];
+        timerPendingLogUnratedRecord = [record copy];
+        return YES;
+    } @catch (NSException *exception) {
+        NSLog(@"写入微微倒计时日志失败：%@", exception);
+        [logFile closeFile];
+        return NO;
+    }
+}
+
+// 将结束面板选中的评分写回刚完成的同一条日志。
+static BOOL updateTimerCompletionRating(NSString *rating) {
+    if (timerPendingLogPath == nil || timerPendingLogRecord == nil || rating == nil) return NO;
+    NSError *readError = nil;
+    NSString *contents = [NSString stringWithContentsOfFile:timerPendingLogPath
+                                                    encoding:NSUTF8StringEncoding
+                                                       error:&readError];
+    if (contents == nil || [contents rangeOfString:timerPendingLogRecord].location == NSNotFound) {
+        NSLog(@"无法找到本次倒计时日志行：%@", readError);
+        return NO;
+    }
+    NSString *updatedRecord = [timerPendingLogRecord stringByReplacingOccurrencesOfString:@"本次打分：未评分"
+                                                                                 withString:[NSString stringWithFormat:@"本次打分：%@", rating]];
+    if ([updatedRecord isEqualToString:timerPendingLogRecord]) {
+        updatedRecord = [timerPendingLogUnratedRecord stringByReplacingOccurrencesOfString:@"本次打分：未评分"
+                                                                               withString:[NSString stringWithFormat:@"本次打分：%@", rating]];
+    }
+    NSString *recordToReplace = [contents rangeOfString:timerPendingLogRecord].location != NSNotFound
+        ? timerPendingLogRecord : timerPendingLogUnratedRecord;
+    if (recordToReplace == nil || [contents rangeOfString:recordToReplace].location == NSNotFound) return NO;
+    NSString *updatedContents = [contents stringByReplacingOccurrencesOfString:recordToReplace withString:updatedRecord];
+    NSError *writeError = nil;
+    if (![updatedContents writeToFile:timerPendingLogPath atomically:YES encoding:NSUTF8StringEncoding error:&writeError]) {
+        NSLog(@"写入本次倒计时评分失败：%@", writeError);
+        return NO;
+    }
+    [timerPendingLogRecord release];
+    timerPendingLogRecord = [updatedRecord copy];
+    return YES;
+}
 
 // 红色倒计时浮球，右键提供隐藏操作。
 @interface TimerBallView : NSView
@@ -80,7 +181,8 @@ static NSWindow *timerDoneWindow = nil;
 }
 - (void)drawRect:(NSRect)dirtyRect {
     (void)dirtyRect;
-    [[NSColor colorWithRed:0.88 green:0.12 blue:0.16 alpha:1.0] setFill];
+    // 仅让红色球体半透明，倒计时文字继续保持清晰不透明。
+    [[NSColor colorWithRed:0.88 green:0.12 blue:0.16 alpha:0.5] setFill];
     NSBezierPath *ballPath = [NSBezierPath bezierPathWithOvalInRect:NSInsetRect(self.bounds, 4, 4)];
     NSShadow *shadow = [[[NSShadow alloc] init] autorelease];
     [shadow setShadowColor:[[NSColor blackColor] colorWithAlphaComponent:0.24]];
@@ -184,8 +286,15 @@ static OSStatus handlePrintScreenHotKey(EventHandlerCallRef nextHandler,
 @property(nonatomic, retain) NSTextField *timerConfig10Field;
 @property(nonatomic, retain) NSTextField *timerConfig20Field;
 @property(nonatomic, retain) NSTextField *timerConfig30Field;
+@property(nonatomic, retain) NSButton *timerLogToggle;
+@property(nonatomic, retain) NSButton *timerEnforcementToggle;
+@property(nonatomic, retain) NSButton *timerDoneBackgroundToggle;
+@property(nonatomic, retain) NSTextField *timerIdleMinutesField;
+@property(nonatomic, retain) NSTextField *timerRatingLabel;
 - (void)refreshCodexQuotaBarTitle;
-- (void)startTimerForDuration:(NSInteger)duration recordAsLast:(BOOL)recordAsLast;
+- (void)startTimerForDuration:(NSInteger)duration;
+- (void)checkForcedTimerReminder:(NSTimer *)timer;
+- (void)rateTimerCompletion:(id)sender;
 @end
 
 @implementation HelloController
@@ -203,6 +312,10 @@ static OSStatus handlePrintScreenHotKey(EventHandlerCallRef nextHandler,
         [self closeTimerDone:nil];
         return NO;
     }
+    if (sender == timerReminderWindow) {
+        [self closeTimerReminder:nil];
+        return NO;
+    }
     [sender orderOut:nil];
     return NO;
 }
@@ -214,6 +327,7 @@ static OSStatus handlePrintScreenHotKey(EventHandlerCallRef nextHandler,
 }
 
 // 保存三档分钟配置，并同步顶部菜单中的档位名称。
+// 保存档位、每日记录和强制提醒配置，并更新菜单显示及闲置监测。
 - (void)saveTimerConfiguration:(id)sender {
     (void)sender;
     NSTextField *fields[3] = {self.timerConfig10Field, self.timerConfig20Field, self.timerConfig30Field};
@@ -227,20 +341,49 @@ static OSStatus handlePrintScreenHotKey(EventHandlerCallRef nextHandler,
         NSMenuItem *item = [self.timerMenuItems objectAtIndex:i];
         [item setTitle:[NSString stringWithFormat:@"%d 分钟", timerMinutes[i]]];
     }
+
+    BOOL wasEnforcementEnabled = timerEnforcementEnabled;
+    NSInteger previousIdleMinutes = timerIdleMinutes;
+    timerLogEnabled = [self.timerLogToggle state] == NSControlStateValueOn;
+    timerEnforcementEnabled = [self.timerEnforcementToggle state] == NSControlStateValueOn;
+    timerDoneBackgroundEnabled = [self.timerDoneBackgroundToggle state] == NSControlStateValueOn;
+    timerIdleMinutes = [self.timerIdleMinutesField integerValue];
+    if (timerIdleMinutes < 1) timerIdleMinutes = 1;
+    if (timerIdleMinutes > 1440) timerIdleMinutes = 1440;
+    [self.timerIdleMinutesField setIntegerValue:timerIdleMinutes];
+
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setBool:timerLogEnabled forKey:@"timerLogEnabled"];
+    [defaults setBool:timerEnforcementEnabled forKey:@"timerEnforcementEnabled"];
+    [defaults setBool:timerDoneBackgroundEnabled forKey:@"timerDoneBackgroundEnabled"];
+    [defaults setInteger:timerIdleMinutes forKey:@"timerIdleMinutes"];
+    [timerDoneBackgroundView setHidden:!timerDoneBackgroundEnabled];
+    if (!timerEnforcementEnabled) {
+        timerIdleSince = nil;
+        timerReminderDueAt = nil;
+        [timerReminderWindow orderOut:nil];
+    } else if (!wasEnforcementEnabled || previousIdleMinutes != timerIdleMinutes || timerIdleSince == nil) {
+        timerIdleSince = [NSDate date];
+        timerReminderDueAt = nil;
+    }
 }
 
 // 根据菜单选择启动唯一倒计时，并创建屏幕上的红色圆球。
 - (void)startTimerPreset:(id)sender {
     NSInteger index = [sender tag];
     if (index < 0 || index >= 3) return;
-    [self startTimerForDuration:timerMinutes[index] * 60 recordAsLast:YES];
+    [self startTimerForDuration:timerMinutes[index] * 60];
 }
 
-// 用指定时长启动倒计时；“重复上一次”沿用原时长，不覆盖记录。
-- (void)startTimerForDuration:(NSInteger)duration recordAsLast:(BOOL)recordAsLast {
+// 用指定时长启动唯一倒计时，并显示置顶红色圆球。
+- (void)startTimerForDuration:(NSInteger)duration {
     if (duration <= 0) return;
+    if ([timerReminderWindow isVisible]) [timerReminderWindow orderOut:nil];
     timerRemainingSeconds = duration;
-    if (recordAsLast) timerLastDurationSeconds = duration;
+    timerConfiguredDurationSeconds = duration;
+    timerStartedAt = [NSDate date];
+    timerIdleSince = nil;
+    timerReminderDueAt = nil;
     timerRunning = YES; timerPaused = NO; timerSessionActive = YES; timerHidden = NO; timerHiddenUntil = nil;
     if (timerTick != nil) { [timerTick invalidate]; timerTick = nil; }
     // 普通 Timer 在菜单追踪事件模式下会暂停；加入 CommonModes 后菜单展开时仍每秒刷新剩余时间。
@@ -279,6 +422,12 @@ static OSStatus handlePrintScreenHotKey(EventHandlerCallRef nextHandler,
     if (timerRemainingSeconds > 0) timerRemainingSeconds--;
     [self refreshTimerDisplay]; [self refreshTimerMenu];
     if (timerRemainingSeconds == 0) {
+        NSDate *endedAt = [NSDate date];
+        if (timerStartedAt != nil && timerLogEnabled &&
+            !appendTimerCompletionLog(timerStartedAt, endedAt, timerConfiguredDurationSeconds)) {
+            NSLog(@"本次微微倒计时未能写入日志。");
+        }
+        timerStartedAt = nil;
         timerRunning = NO; [timerTick invalidate]; timerTick = nil; [timerBallPanel orderOut:nil];
         if (timerDoneWindow == nil) {
             timerDoneWindow = [[TimerDoneWindow alloc] initWithContentRect:NSMakeRect(0, 0, 325, 325) styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable backing:NSBackingStoreBuffered defer:NO];
@@ -286,25 +435,49 @@ static OSStatus handlePrintScreenHotKey(EventHandlerCallRef nextHandler,
             [timerDoneWindow setLevel:NSStatusWindowLevel];
             [timerDoneWindow setCollectionBehavior:NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary];
             [timerDoneWindow setBackgroundColor:[NSColor colorWithCalibratedRed:0.94 green:0.94 blue:0.94 alpha:1]];
+        NSString *backgroundPath = [[NSBundle mainBundle] pathForResource:@"TimerDoneBackground" ofType:@"jpg"];
+            NSImage *backgroundImage = [[NSImage alloc] initWithContentsOfFile:backgroundPath];
+            if (backgroundImage != nil) {
+                timerDoneBackgroundView = [[NSImageView alloc] initWithFrame:[[timerDoneWindow contentView] bounds]];
+                [timerDoneBackgroundView setImage:backgroundImage];
+                [timerDoneBackgroundView setImageScaling:NSImageScaleProportionallyUpOrDown];
+                [timerDoneBackgroundView setAlphaValue:0.5];
+                [timerDoneBackgroundView setHidden:!timerDoneBackgroundEnabled];
+                [[timerDoneWindow contentView] addSubview:timerDoneBackgroundView positioned:NSWindowBelow relativeTo:nil];
+            }
             NSTextField *done = [NSTextField labelWithString:@"时间到"]; [done setFrame:NSMakeRect(25, 135, 275, 60)];
             [done setFont:[NSFont boldSystemFontOfSize:40]]; [done setAlignment:NSTextAlignmentCenter]; [[timerDoneWindow contentView] addSubview:done];
+            self.timerRatingLabel = [NSTextField labelWithString:@"本次打分"]; [self.timerRatingLabel setFrame:NSMakeRect(55, 108, 215, 22)];
+            [self.timerRatingLabel setAlignment:NSTextAlignmentCenter]; [self.timerRatingLabel setFont:[NSFont systemFontOfSize:14]];
+            [[timerDoneWindow contentView] addSubview:self.timerRatingLabel];
+            NSArray *ratings = @[@"烂", @"差", @"良", @"优"];
+            for (NSInteger index = 0; index < [ratings count]; index++) {
+                NSButton *ratingButton = [NSButton buttonWithTitle:[ratings objectAtIndex:index] target:self action:@selector(rateTimerCompletion:)];
+                [ratingButton setTag:index]; [ratingButton setFrame:NSMakeRect(48 + index * 58, 70, 48, 30)];
+                [ratingButton setBezelStyle:NSBezelStyleRounded]; [[timerDoneWindow contentView] addSubview:ratingButton];
+            }
             NSButton *close = [NSButton buttonWithTitle:@"关闭" target:self action:@selector(closeTimerDone:)];
-            [close setFrame:NSMakeRect(36, 70, 112, 36)]; [close setBezelStyle:NSBezelStyleRounded]; [[timerDoneWindow contentView] addSubview:close];
-            NSButton *repeat = [NSButton buttonWithTitle:@"重复上一次" target:self action:@selector(repeatLastTimer:)];
-            [repeat setFrame:NSMakeRect(170, 70, 120, 36)]; [repeat setBezelStyle:NSBezelStyleRounded]; [[timerDoneWindow contentView] addSubview:repeat];
+            [close setFrame:NSMakeRect(105, 27, 115, 36)]; [close setBezelStyle:NSBezelStyleRounded]; [[timerDoneWindow contentView] addSubview:close];
         }
+        [self.timerRatingLabel setStringValue:@"本次打分"];
+        [timerDoneBackgroundView setHidden:!timerDoneBackgroundEnabled];
         [timerDoneWindow center];
         [timerDoneWindow makeKeyAndOrderFront:nil]; [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
         [self refreshTimerMenu];
     }
 }
 
-// 收起结束提示，并按最近一次选中的完整时长重新开始。
-- (void)repeatLastTimer:(id)sender {
-    (void)sender;
-    if (timerLastDurationSeconds <= 0) return;
-    [timerDoneWindow orderOut:nil];
-    [self startTimerForDuration:timerLastDurationSeconds recordAsLast:NO];
+// 保存结束面板的评分，并在面板上显示当前选择。
+- (void)rateTimerCompletion:(id)sender {
+    NSArray *ratings = @[@"烂", @"差", @"良", @"优"];
+    NSInteger index = [sender tag];
+    if (index < 0 || index >= [ratings count]) return;
+    NSString *rating = [ratings objectAtIndex:index];
+    if (updateTimerCompletionRating(rating)) {
+        [self.timerRatingLabel setStringValue:[NSString stringWithFormat:@"本次打分：%@", rating]];
+    } else {
+        [self.timerRatingLabel setStringValue:@"评分没有写入日志"];
+    }
 }
 
 // 仅由“关闭”按钮收起时间到提示。
@@ -312,6 +485,9 @@ static OSStatus handlePrintScreenHotKey(EventHandlerCallRef nextHandler,
     (void)sender;
     [timerDoneWindow orderOut:nil];
     timerRunning = NO; timerPaused = NO; timerSessionActive = NO; timerRemainingSeconds = 0;
+    timerConfiguredDurationSeconds = 0;
+    timerIdleSince = [NSDate date];
+    timerReminderDueAt = nil;
     [self refreshTimerMenu];
 }
 
@@ -322,8 +498,67 @@ static OSStatus handlePrintScreenHotKey(EventHandlerCallRef nextHandler,
 // 停止倒计时并关闭浮球。
 - (void)stopTimer:(id)sender {
     (void)sender; timerRunning = NO; timerPaused = NO; timerSessionActive = NO; timerRemainingSeconds = 0;
+    timerStartedAt = nil; timerConfiguredDurationSeconds = 0; timerIdleSince = [NSDate date]; timerReminderDueAt = nil;
     if (timerTick != nil) { [timerTick invalidate]; timerTick = nil; }
     [timerBallPanel orderOut:nil]; [self refreshTimerMenu];
+}
+
+// 闲置达到设定分钟数后显示置顶提醒；提醒关闭后重新计算下一轮间隔。
+- (void)checkForcedTimerReminder:(NSTimer *)timer {
+    (void)timer;
+    if (!timerEnforcementEnabled || timerSessionActive || timerRunning || timerPaused ||
+        [timerReminderWindow isVisible]) return;
+    NSDate *now = [NSDate date];
+    BOOL repeatReminderNow = NO;
+    if (timerReminderDueAt != nil) {
+        if ([now compare:timerReminderDueAt] == NSOrderedAscending) return;
+        timerReminderDueAt = nil;
+        repeatReminderNow = YES;
+    }
+    if (!repeatReminderNow) {
+        if (timerIdleSince == nil) timerIdleSince = now;
+        NSTimeInterval idleSeconds = -[timerIdleSince timeIntervalSinceNow];
+        if (idleSeconds < timerIdleMinutes * 60) return;
+    }
+
+    if (timerReminderWindow == nil) {
+        timerReminderWindow = [[TimerDoneWindow alloc] initWithContentRect:NSMakeRect(0, 0, 325, 325)
+            styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+            backing:NSBackingStoreBuffered defer:NO];
+        [timerReminderWindow setTitle:@"微微倒计时"];
+        [timerReminderWindow setReleasedWhenClosed:NO];
+        [timerReminderWindow setDelegate:self];
+        [timerReminderWindow setLevel:NSStatusWindowLevel];
+        [timerReminderWindow setCollectionBehavior:NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary];
+        [timerReminderWindow setBackgroundColor:[NSColor colorWithCalibratedRed:0.94 green:0.94 blue:0.94 alpha:1]];
+        // 上方用小字给出行动提示，下方保留醒目的倒计时提醒。
+        NSTextField *instruction = [NSTextField labelWithString:@"关闭所有无关窗口，继续干正事！"];
+        [instruction setFrame:NSMakeRect(20, 202, 285, 28)];
+        [instruction setFont:[NSFont systemFontOfSize:13]];
+        [instruction setAlignment:NSTextAlignmentCenter];
+        [[timerReminderWindow contentView] addSubview:instruction];
+        NSTextField *reminder = [NSTextField labelWithString:@"快使用微微倒计时"];
+        [reminder setFrame:NSMakeRect(20, 135, 285, 60)];
+        [reminder setFont:[NSFont boldSystemFontOfSize:26]];
+        [reminder setAlignment:NSTextAlignmentCenter];
+        [[timerReminderWindow contentView] addSubview:reminder];
+        NSButton *close = [NSButton buttonWithTitle:@"关闭" target:self action:@selector(closeTimerReminder:)];
+        [close setFrame:NSMakeRect(105, 82, 115, 36)];
+        [close setBezelStyle:NSBezelStyleRounded];
+        [[timerReminderWindow contentView] addSubview:close];
+    }
+    timerReminderDueAt = nil;
+    [timerReminderWindow center];
+    [timerReminderWindow makeKeyAndOrderFront:nil];
+    [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
+}
+
+// 关闭强制提醒后设置 1 分钟宽限期，到期仍未开始计时便再次提醒。
+- (void)closeTimerReminder:(id)sender {
+    (void)sender;
+    [timerReminderWindow orderOut:nil];
+    timerIdleSince = [NSDate date];
+    timerReminderDueAt = [NSDate dateWithTimeIntervalSinceNow:60];
 }
 
 // 支持右键菜单中的立即隐藏与隐藏一分钟，隐藏期间时钟仍继续运行。
@@ -633,19 +868,61 @@ static OSStatus handlePrintScreenHotKey(EventHandlerCallRef nextHandler,
     NSTextField *fields[3];
     for (int i = 0; i < 3; i++) {
         NSString *labelText = [NSString stringWithFormat:@"档位 %d（分钟）", i + 1];
-        NSTextField *label = [NSTextField labelWithString:labelText]; [label setFrame:NSMakeRect(48, 226 - i*64, 150, 26)]; [contentView addSubview:label];
-        fields[i] = [[NSTextField alloc] initWithFrame:NSMakeRect(220, 224 - i*64, 110, 30)];
+        NSTextField *label = [NSTextField labelWithString:labelText]; [label setFrame:NSMakeRect(48, 232 - i*42, 150, 26)]; [contentView addSubview:label];
+        fields[i] = [[NSTextField alloc] initWithFrame:NSMakeRect(220, 230 - i*42, 110, 30)];
         NSInteger configured = [[NSUserDefaults standardUserDefaults] integerForKey:[NSString stringWithFormat:@"timerMinutes%d", i]];
         if (configured < 1 || configured > 999) configured = timerMinutes[i];
         timerMinutes[i] = (int)configured; [fields[i] setIntegerValue:configured]; [contentView addSubview:fields[i]];
     }
     self.timerConfig10Field = fields[0]; self.timerConfig20Field = fields[1]; self.timerConfig30Field = fields[2];
+
+    // 两项配置首次运行默认开启，闲置监测默认 30 分钟。
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    id logPreference = [defaults objectForKey:@"timerLogEnabled"];
+    id enforcementPreference = [defaults objectForKey:@"timerEnforcementEnabled"];
+    id backgroundPreference = [defaults objectForKey:@"timerDoneBackgroundEnabled"];
+    timerLogEnabled = logPreference == nil ? YES : [defaults boolForKey:@"timerLogEnabled"];
+    timerEnforcementEnabled = enforcementPreference == nil ? YES : [defaults boolForKey:@"timerEnforcementEnabled"];
+    timerDoneBackgroundEnabled = backgroundPreference == nil ? YES : [defaults boolForKey:@"timerDoneBackgroundEnabled"];
+    NSInteger idleMinutes = [defaults integerForKey:@"timerIdleMinutes"];
+    if (idleMinutes < 1 || idleMinutes > 1440) idleMinutes = 30;
+    timerIdleMinutes = idleMinutes;
+
+    self.timerLogToggle = [NSButton checkboxWithTitle:@"记录每次完整结束的计时" target:nil action:nil];
+    [self.timerLogToggle setFrame:NSMakeRect(48, 101, 270, 24)];
+    [self.timerLogToggle setState:timerLogEnabled ? NSControlStateValueOn : NSControlStateValueOff];
+    [contentView addSubview:self.timerLogToggle];
+
+    self.timerDoneBackgroundToggle = [NSButton checkboxWithTitle:@"结束面板背景图" target:nil action:nil];
+    [self.timerDoneBackgroundToggle setFrame:NSMakeRect(330, 101, 230, 24)];
+    [self.timerDoneBackgroundToggle setState:timerDoneBackgroundEnabled ? NSControlStateValueOn : NSControlStateValueOff];
+    [contentView addSubview:self.timerDoneBackgroundToggle];
+
+    self.timerEnforcementToggle = [NSButton checkboxWithTitle:@"强制使用提醒" target:nil action:nil];
+    [self.timerEnforcementToggle setFrame:NSMakeRect(48, 66, 200, 24)];
+    [self.timerEnforcementToggle setState:timerEnforcementEnabled ? NSControlStateValueOn : NSControlStateValueOff];
+    [contentView addSubview:self.timerEnforcementToggle];
+    NSTextField *idleLabel = [NSTextField labelWithString:@"闲置监测（分钟）"];
+    [idleLabel setFrame:NSMakeRect(300, 66, 140, 24)];
+    [contentView addSubview:idleLabel];
+    self.timerIdleMinutesField = [[NSTextField alloc] initWithFrame:NSMakeRect(440, 63, 72, 28)];
+    [self.timerIdleMinutesField setIntegerValue:timerIdleMinutes];
+    [contentView addSubview:self.timerIdleMinutesField];
+
     NSButton *save = [NSButton buttonWithTitle:@"保存设置" target:self action:@selector(saveTimerConfiguration:)];
-    [save setFrame:NSMakeRect(48, 8, 120, 34)]; [save setBezelStyle:NSBezelStyleRounded]; [contentView addSubview:save];
+    [save setFrame:NSMakeRect(48, 8, 120, 32)]; [save setBezelStyle:NSBezelStyleRounded]; [contentView addSubview:save];
     NSButton *showBall = [NSButton buttonWithTitle:@"重新显示圆球" target:self action:@selector(showTimerBall:)];
-    [showBall setFrame:NSMakeRect(188, 8, 150, 34)]; [showBall setBezelStyle:NSBezelStyleRounded]; [contentView addSubview:showBall];
-    NSTextField *hint = [NSTextField labelWithString:@"选择菜单栏中的分钟档位开始；圆球右键可隐藏，隐藏时倒计时继续。"];
-    [hint setFrame:NSMakeRect(48, 50, 500, 32)]; [hint setMaximumNumberOfLines:2]; [contentView addSubview:hint];
+    [showBall setFrame:NSMakeRect(188, 8, 150, 32)]; [showBall setBezelStyle:NSBezelStyleRounded]; [contentView addSubview:showBall];
+    NSTextField *hint = [NSTextField labelWithString:@"日志：~/studio/go-hello-mac/time-log/YYYY-MM-DD.log；仅记录完成的计时。"];
+    [hint setFrame:NSMakeRect(48, 39, 520, 18)]; [hint setFont:[NSFont systemFontOfSize:11]]; [contentView addSubview:hint];
+
+    if (timerEnforcementEnabled && timerIdleSince == nil) timerIdleSince = [NSDate date];
+    if (!timerEnforcementEnabled) { timerIdleSince = nil; timerReminderDueAt = nil; }
+    if (timerIdleMonitor == nil) {
+        timerIdleMonitor = [NSTimer timerWithTimeInterval:5.0 target:self
+            selector:@selector(checkForcedTimerReminder:) userInfo:nil repeats:YES];
+        [[NSRunLoop mainRunLoop] addTimer:timerIdleMonitor forMode:NSRunLoopCommonModes];
+    }
 }
 
 // 构造功能 1 页面，集中展示脚本状态、执行详情和操作按钮。
